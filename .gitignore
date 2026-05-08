@@ -1,0 +1,18 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.log
+
+## Azure
+*.pubxml
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Env
+.env
+local.settings.json
