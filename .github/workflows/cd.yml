@@ -1,0 +1,134 @@
+name: CD – Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  AZURE_LOCATION: ${{ vars.AZURE_LOCATION || 'eastus' }}
+
+jobs:
+  # ── 1. Deploy Infrastructure ──────────────────────────────────────────────
+  deploy-infra:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      cosmosDbEndpoint: ${{ steps.arm.outputs.cosmosDbEndpoint }}
+      appServiceName: ${{ steps.arm.outputs.appServiceName }}
+      appServiceHostname: ${{ steps.arm.outputs.appServiceHostname }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group exists
+        run: |
+          az group create \
+            --name ${{ env.AZURE_RESOURCE_GROUP }} \
+            --location ${{ env.AZURE_LOCATION }} \
+            --output none
+
+      - name: Deploy ARM template (Incremental – idempotent)
+        id: arm
+        run: |
+          OUTPUT=$(az deployment group create \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --template-file infra/azuredeploy.json \
+            --parameters infra/azuredeploy.parameters.json \
+            --mode Incremental \
+            --output json)
+
+          COSMOS_ENDPOINT=$(echo "$OUTPUT" | jq -r '.properties.outputs.cosmosDbEndpoint.value')
+          APP_NAME=$(echo "$OUTPUT"        | jq -r '.properties.outputs.appServiceName.value')
+          APP_HOST=$(echo "$OUTPUT"        | jq -r '.properties.outputs.appServiceHostname.value')
+
+          echo "cosmosDbEndpoint=$COSMOS_ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "appServiceName=$APP_NAME"           >> "$GITHUB_OUTPUT"
+          echo "appServiceHostname=$APP_HOST"       >> "$GITHUB_OUTPUT"
+
+      - name: Configure App Service settings
+        run: |
+          az webapp config appsettings set \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --name ${{ steps.arm.outputs.appServiceName }} \
+            --settings \
+              COSMOSDB_ENDPOINT="${{ steps.arm.outputs.cosmosDbEndpoint }}" \
+              COSMOSDB_DATABASE="SpaceExplorer" \
+              WEBSITE_RUN_FROM_PACKAGE="1" \
+            --output none
+
+  # ── 2. Build App Artifact ─────────────────────────────────────────────────
+  build:
+    name: Build App
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore & Publish
+        run: |
+          dotnet restore src/SpaceExplorer.sln
+          dotnet publish src/SpaceExplorer/SpaceExplorer.csproj \
+            --configuration Release \
+            --no-restore \
+            --output ./publish
+
+      - name: Zip artifact
+        run: cd publish && zip -r ../spaceexplorer.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spaceexplorer-app
+          path: spaceexplorer.zip
+          retention-days: 7
+
+  # ── 3. Deploy App (requires manual approval) ─────────────────────────────
+  deploy-app:
+    name: Deploy App to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-infra, build]
+    environment: production          # ← triggers manual approval gate
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spaceexplorer-app
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to App Service
+        run: |
+          az webapp deploy \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --name ${{ needs.deploy-infra.outputs.appServiceName }} \
+            --src-path spaceexplorer.zip \
+            --type zip \
+            --async false
+
+      - name: Print deployment URL
+        run: |
+          echo "🚀 Deployed to: https://${{ needs.deploy-infra.outputs.appServiceHostname }}"
